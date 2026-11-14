@@ -7,6 +7,7 @@
 
 #[macro_use]
 mod sys;
+mod i18n;
 mod ampr_index;
 mod cache;
 mod config;
@@ -55,7 +56,7 @@ fn check_space(state: &State, s: &Settings) {
     let low = free < s.low_space_gb << 30;
     state.low_space.store(low, Ordering::SeqCst);
     if low && !WARNED.swap(true, Ordering::SeqCst) {
-        toast(s, &format!("Kraken Mount: /data has only {} GB free", free >> 30));
+        toast(s, &i18n::low_space(i18n::lang(), free >> 30));
     }
 }
 
@@ -86,7 +87,7 @@ fn build_and_register(state: &State, s: &Settings, src: &Source, fresh: &Fresh, 
         match fresh {
             Fresh::Stale(why) => log!("{tid}: cache stale ({why}); rebuilding"),
             Fresh::Missing => log!("{tid}: no cache; building"),
-            Fresh::Fresh | Fresh::Fakelib(_) => log!("{tid}: rebuild forced"),
+            Fresh::Fresh | Fresh::Fakelib(_) | Fresh::Moved(_) => log!("{tid}: rebuild forced"),
         }
         state.update(&src.path, |g| g.status = "building");
         check_space(state, s);
@@ -98,12 +99,32 @@ fn build_and_register(state: &State, s: &Settings, src: &Source, fresh: &Fresh, 
     Ok(true)
 }
 
+/// Fresh::Moved: a folder game's /system_ex/app/<TID> stack (nullfs + backport unionfs) is redone
+/// on the new folder first, so a failed relink is retried next scan; then the cache is relinked
+/// (a pkg's app0 is its cache dir: no remount; launch.rs mounts the pkg's folder from the stamp).
+/// Only reached from the scan loop, which never runs while a game does.
+fn relink_moved(s: &Settings, src: &Source, from: &std::path::Path) -> std::io::Result<()> {
+    if src.kind != Kind::Pkg {
+        register::remount(&src.title_id, &cache::app0(src), backport_of(src))?;
+    }
+    cache::relink(src, s, from)?;
+    toast(s, &i18n::moved(i18n::lang(), &src.title_name, &src.path.to_string_lossy()));
+    Ok(())
+}
+
 /// One game of the scan: check, build, register, status. A failed game is retried only when
 /// its inputs_key changes or a rebuild is forced.
 fn process(state: &State, s: &Settings, src: &Source, registered: &mut HashSet<String>, failed: &mut HashMap<PathBuf, String>) {
     let tid = &src.title_id;
     let forced = state.forced.lock().unwrap().remove(tid);
-    let fresh = cache::check(src, s);
+    let mut fresh = cache::check(src, s);
+    if let (false, Fresh::Moved(from)) = (forced, &fresh) {
+        fresh = match relink_moved(s, src, from) {
+            Ok(()) => cache::check(src, s),
+            // The rebuild path below logs and reports what still fails.
+            Err(e) => Fresh::Stale(format!("relink failed: {e}")),
+        };
+    }
     let r = if !forced && failed.get(&src.path) == Some(&inputs_key(src, s)) {
         state.update(&src.path, |g| g.status = "error");
         return;
@@ -131,7 +152,7 @@ fn process(state: &State, s: &Settings, src: &Source, registered: &mut HashSet<S
                 (g.status, g.error, g.cache_size, g.cache_built) = ("ready", None, size, built);
             });
             if new {
-                toast(s, &format!("{} registered", src.title_name));
+                toast(s, &i18n::registered(i18n::lang(), &src.title_name));
             }
         }
         Err(e) => {
@@ -141,7 +162,7 @@ fn process(state: &State, s: &Settings, src: &Source, registered: &mut HashSet<S
             state.update(&src.path, |g| {
                 (g.status, g.error, g.cache_size, g.cache_built) = ("error", Some(e.clone()), size, built);
             });
-            toast(s, &format!("{}: failed, see the log", src.title_name));
+            toast(s, &i18n::failed(i18n::lang(), &src.title_name));
         }
     }
 }
@@ -232,9 +253,120 @@ const BUNDLED_AMPR_VERSION: &str = include_str!("../vendor/ampr-emu-ng/VERSION")
 /// "<len> <crc32>" of the bundled copy last written. Outside AMPR_DIR: every file there goes into fakelib/.
 const BUNDLED_MARK: &str = "/data/krakenmount/ampr.bundled";
 
+/// Where tidy_ampr_dir moves things that were blocking AMPR_DIR/libSceAmpr.sprx. Outside AMPR_DIR.
+const AMPR_MOVED: &str = "/data/krakenmount/ampr.moved";
+const AMPR_NAME: &str = "libSceAmpr.sprx";
+
+/// The first regular file named libSceAmpr.sprx (any case) in `dir` or up to `depth` levels below it.
+fn find_ampr_file(dir: &std::path::Path, depth: u32) -> Option<PathBuf> {
+    let mut subdirs = Vec::new();
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        let Ok(md) = std::fs::metadata(&p) else { continue };
+        if md.is_file() && md.len() > 0 && e.file_name().to_string_lossy().eq_ignore_ascii_case(AMPR_NAME) {
+            return Some(p);
+        }
+        if md.is_dir() {
+            subdirs.push(p);
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    subdirs.into_iter().find_map(|d| find_ampr_file(&d, depth - 1))
+}
+
+/// Moves `p` out of AMPR_DIR into AMPR_MOVED (kept, not deleted) so the canonical path is free.
+fn move_aside(p: &std::path::Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(AMPR_MOVED)?;
+    let base = p.file_name().map_or_else(|| "entry".into(), |n| n.to_string_lossy().into_owned());
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let dest = PathBuf::from(AMPR_MOVED).join(format!("{base}.{stamp}"));
+    std::fs::rename(p, &dest)?;
+    Ok(dest)
+}
+
+/// Fixes the usual hand-copy mistakes so AMPR_DIR/libSceAmpr.sprx is a regular file:
+/// - a folder named libSceAmpr.sprx (an extracted zip): the .sprx inside is moved up, the folder aside;
+/// - a broken symlink or other non-file there: moved aside;
+/// - the file in a subfolder (ampr/ampr-emu-ng/libSceAmpr.sprx) or in another letter case: moved
+///   to the exact name (the PS5's /data is case-sensitive and fakelib only takes AMPR_DIR's own files).
+/// Returns a short reason when the path is still not a usable file, for the web UI.
+fn tidy_ampr_dir() -> Option<String> {
+    let dir = std::path::Path::new(cache::AMPR_DIR);
+    let path = dir.join(AMPR_NAME);
+    let usable = |p: &std::path::Path| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0);
+    if usable(&path) {
+        return None;
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(md) if md.is_dir() => {
+            // Take the .sprx out first (to a temp beside AMPR_DIR), then move the folder aside.
+            let inner = find_ampr_file(&path, 2);
+            let tmp = PathBuf::from(format!("{DATA_DIR}/{AMPR_NAME}.found"));
+            let staged = inner.as_ref().and_then(|f| match std::fs::rename(f, &tmp) {
+                Ok(()) => Some(tmp.clone()),
+                Err(e) => {
+                    log!("ampr: move {} out of its folder: {e}", f.display());
+                    None
+                }
+            });
+            match move_aside(&path) {
+                Ok(d) => log!("ampr: {} was a folder, not a file: moved to {}", path.display(), d.display()),
+                Err(e) => {
+                    log!("ampr: {} is a folder and could not be moved: {e}", path.display());
+                    return Some(format!("{} is a folder, not a file", path.display()));
+                }
+            }
+            if let Some(t) = staged {
+                match std::fs::rename(&t, &path) {
+                    Ok(()) => log!("ampr: used the {AMPR_NAME} found inside that folder"),
+                    Err(e) => log!("ampr: rename {} to {}: {e}", t.display(), path.display()),
+                }
+            }
+        }
+        Ok(_) => match move_aside(&path) {
+            // An empty file (a failed upload), a dangling symlink or a special file.
+            Ok(d) => log!("ampr: {} was empty or not a regular file: moved to {}", path.display(), d.display()),
+            Err(e) => return Some(format!("{} is not a regular file ({e})", path.display())),
+        },
+        Err(_) => {}
+    }
+    if usable(&path) {
+        return None;
+    }
+    // Wrong case in AMPR_DIR itself, or one or two folders down.
+    if let Some(found) = find_ampr_file(dir, 2) {
+        match std::fs::rename(&found, &path) {
+            Ok(()) => log!("ampr: moved {} to {}", found.display(), path.display()),
+            Err(e) => return Some(format!("found {} but could not move it: {e}", found.display())),
+        }
+    }
+    None
+}
+
+/// Last reason AMPR_DIR/libSceAmpr.sprx is not usable (empty = fine). Shown by the web UI.
+pub static AMPR_PROBLEM: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn set_ampr_problem(p: Option<String>) {
+    *AMPR_PROBLEM.lock().unwrap_or_else(|e| e.into_inner()) = p.unwrap_or_default();
+}
+
+/// tidy_ampr_dir, the bundled install, chmod. At start, and on each scan pass while the file is
+/// missing, so a copy over FTP (or a fix) is picked up without restarting the payload.
+fn ensure_ampr() {
+    let problem = tidy_ampr_dir();
+    let p = install_bundled_ampr().or(problem);
+    prepare_ampr();
+    let path = std::path::Path::new(cache::AMPR_DIR).join(AMPR_NAME);
+    let ok = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > 0);
+    set_ampr_problem(if ok { None } else { Some(p.unwrap_or_else(|| format!("{} not found", path.display()))) });
+}
+
 /// Puts the bundled libSceAmpr.sprx into AMPR_DIR when it is missing or is a bundled copy we wrote
 /// before (an older release). A file put there by hand (a debug build, say) is kept.
-fn install_bundled_ampr() {
+/// Returns the error when the install failed.
+fn install_bundled_ampr() -> Option<String> {
     let path = format!("{}/libSceAmpr.sprx", cache::AMPR_DIR);
     let mark = |b: &[u8]| format!("{} {:08x}", b.len(), ampr_index::crc32(&[b]));
     let write_mark = || {
@@ -247,17 +379,17 @@ fn install_bundled_ampr() {
             if std::fs::read_to_string(BUNDLED_MARK).ok() != Some(mark(BUNDLED_AMPR)) {
                 write_mark();
             }
-            return;
+            return None;
         }
         Ok(cur) if std::fs::read_to_string(BUNDLED_MARK).is_ok_and(|m| m == mark(&cur)) => {}
         Ok(_) => {
             log!("ampr: {path} is not a bundled ampr-emu-ng: kept (delete it to get {BUNDLED_AMPR_VERSION})");
-            return;
+            return None;
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             log!("ampr: read {path}: {e}");
-            return;
+            return Some(format!("cannot read {path}: {e}"));
         }
     }
     // Temp file beside AMPR_DIR, not in it, so a scan never copies a half-written one.
@@ -269,10 +401,12 @@ fn install_bundled_ampr() {
         Ok(()) => {
             write_mark();
             log!("ampr: installed bundled ampr-emu-ng {BUNDLED_AMPR_VERSION} ({} bytes) to {path}", BUNDLED_AMPR.len());
+            None
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             log!("ampr: install bundled ampr-emu-ng to {path}: {e}");
+            Some(format!("install of the bundled copy failed: {e}"))
         }
     }
 }
@@ -295,24 +429,59 @@ fn prepare_ampr() {
     }
 }
 
+/// ShadowMountPlus's process name (SMP main.c PAYLOAD_NAME): it registers and mounts the same titles.
+const SMP_PROCESS: &str = "shadowmountplus.elf";
+
+/// SMP wait_for_kstuff_ready, plus ShadowMount+ not running: polls every 2 s, one toast per
+/// reason when it starts waiting for it.
+fn wait_ready(state: &State) {
+    let s = state.settings.lock().unwrap().clone();
+    let mut waiting: Option<&str> = None;
+    loop {
+        let why = if !sys::kstuff_loaded() {
+            Some("kstuff")
+        } else if launch::find_pid(SMP_PROCESS).is_some() {
+            Some("shadowmount")
+        } else {
+            None
+        };
+        *state.waiting.lock().unwrap() = why;
+        match why {
+            None => {
+                if let Some(w) = waiting {
+                    log!("{w}: ready; continuing start-up");
+                }
+                return;
+            }
+            Some(w) if waiting != Some(w) => {
+                log!("waiting before start-up: {w}");
+                let l = i18n::lang();
+                toast(&s, if w == "kstuff" { i18n::kstuff_waiting(l) } else { i18n::smp_running(l) });
+                waiting = Some(w);
+            }
+            Some(_) => {}
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
 fn main() {
     // panic=abort: record the panic in kraken.log before the payload dies.
     std::panic::set_hook(Box::new(|info| sys::log_line(&format!("PANIC: {info}"))));
     for dir in [DATA_DIR, cache::CACHES, cache::AMPR_DIR] {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            sys::notify(&format!("Kraken Mount: cannot create {dir}: {e}"));
+            sys::notify(&i18n::cannot_create(i18n::lang(), dir, &e.to_string()));
             return;
         }
     }
     let s = config::load();
     sys::LOG_FILE.store(s.log, Ordering::Relaxed);
     let Some(listener) = web::take_port() else {
-        toast(&s, &format!("Kraken Mount: port {} busy (an older copy that has a game running, or another app?); not started", web::PORT));
+        toast(&s, &i18n::port_busy(i18n::lang(), web::PORT));
         return;
     };
-    toast(&s, "Kraken Mount started");
-    install_bundled_ampr();
-    prepare_ampr();
+    toast(&s, i18n::started(i18n::lang()));
+    ensure_ampr();
     std::thread::spawn(save_self_copy);
     // ponytail: debug turned on later takes effect at the next start.
     if s.debug {
@@ -321,6 +490,8 @@ fn main() {
     let state = Arc::new(State::new(s));
     let web_state = state.clone();
     std::thread::spawn(move || web::serve(web_state, listener));
+    // The web UI is up; nothing mounts until kstuff answers and ShadowMount+ is gone.
+    wait_ready(&state);
     let (titles, running) = (state.titles.clone(), state.running.clone());
     // Built caches are launchable before the first scan ends: watch them from the start.
     for e in std::fs::read_dir(cache::CACHES).into_iter().flatten().flatten() {
@@ -345,6 +516,9 @@ fn main() {
         sys::LOG_FILE.store(s.log, Ordering::Relaxed);
         *state.settings.lock().unwrap() = s.clone();
         state.busy.store(true, Ordering::SeqCst);
+        if !std::fs::metadata(std::path::Path::new(cache::AMPR_DIR).join(AMPR_NAME)).is_ok_and(|m| m.is_file() && m.len() > 0) {
+            ensure_ampr();
+        }
         let roots = if s.scan_paths.is_empty() { storage::default_scan_roots() } else { s.scan_paths.clone() };
         let r = scan::scan(&roots, s.backports);
         if state.paused() {
